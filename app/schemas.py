@@ -350,3 +350,85 @@ class StudySubsetErrorDetail(BaseModel):
     message: str
     study_instance_uid: Optional[str] = None
     problems: list[StudySubsetProblemItem] = []
+
+
+# --------------------------------------------------------------------------- #
+# 跨任务合并下载单个匿名检查（POST /jobs/merged-study/download）
+# --------------------------------------------------------------------------- #
+class MergedStudyDownloadRequest(BaseModel):
+    job_ids: list[str] = Field(
+        description="已完成（status=ready）任务 ID，2～5 个；不得重复",
+        min_length=2,
+        max_length=5,
+    )
+    study_instance_uid: str = Field(
+        description=(
+            "匿名后的 StudyInstanceUID（取自任一参与任务结果中的 "
+            "studies[].new_study_instance_uid）"
+        ),
+        min_length=1,
+    )
+
+    @field_validator("job_ids")
+    @classmethod
+    def _strip_and_reject_duplicates(cls, value: list[str]) -> list[str]:
+        ids = [str(jid).strip() for jid in value]
+        if any(not jid for jid in ids):
+            raise ValueError("任务 ID 不能为空字符串")
+        if len(set(ids)) != len(ids):
+            raise ValueError("任务 ID 不得重复")
+        return ids
+
+    @field_validator("study_instance_uid")
+    @classmethod
+    def _strip_study_uid(cls, value: str) -> str:
+        uid = str(value).strip()
+        if not uid:
+            raise ValueError("study_instance_uid 不能为空字符串")
+        return uid
+
+
+class MergedStudyCopyItem(BaseModel):
+    job_id: str = Field(description="该份物理输出所属任务 ID")
+    output_file: str = Field(description="该任务 output 目录内的扁平匿名文件名")
+    sha256: str = Field(description="该份输出文件内容的 SHA-256（小写十六进制）")
+
+
+class MergedStudyProblemItem(BaseModel):
+    sop_instance_uid: str = Field(description="出问题的匿名（已重写）SOPInstanceUID")
+    reason: str = Field(
+        description="missing_in_all_jobs（引用目标在所有指定任务中均不存在） | "
+        "byte_conflict（同一匿名 SOP UID 的多份输出字节不一致）"
+    )
+    job_ids: list[str] = Field(
+        default=[],
+        description="byte_conflict 时给出相互冲突的输出来源任务 ID（缺失时为空）",
+    )
+    copies: list[MergedStudyCopyItem] = Field(
+        default=[],
+        description="byte_conflict 时给出各份冲突输出（任务/文件名/SHA-256）",
+    )
+    message: str
+
+
+class MergedStudyErrorDetail(BaseModel):
+    code: str = Field(
+        description="JOB_NOT_FOUND（404） | STUDY_NOT_FOUND（404） | "
+        "JOBS_NOT_COMPLETED（409） | SECRET_FINGERPRINT_MISMATCH（409） | "
+        "MERGED_REFERENCE_CLOSURE_INCOMPLETE（409） | "
+        "ANONYMIZED_OUTPUT_UNREADABLE（500）"
+    )
+    message: str
+    study_instance_uid: Optional[str] = None
+    missing_job_ids: list[str] = []
+    not_ready_jobs: list[dict[str, str]] = []
+    fingerprints: dict[str, str] = {}
+    problems: list[MergedStudyProblemItem] = []
+    conflicting_sop_instance_uids: list[str] = Field(
+        default=[],
+        description="同一匿名 SOP UID 对应字节不一致输出的冲突 UID 列表",
+    )
+    missing_sop_instance_uids: list[str] = Field(
+        default=[],
+        description="引用目标在所有指定任务成功输出中均不存在的匿名 UID 列表",
+    )

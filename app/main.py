@@ -12,7 +12,7 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadF
 from fastapi.responses import FileResponse
 
 from .anonymizer import JobResult
-from . import consistency, pagination, study_subset
+from . import consistency, merged_study, pagination, study_subset
 from .config import settings
 from .jobs import registry
 from .schemas import (
@@ -23,6 +23,8 @@ from .schemas import (
     CursorErrorDetail,
     FileOut,
     JobOut,
+    MergedStudyDownloadRequest,
+    MergedStudyErrorDetail,
     PatientOut,
     SeriesOut,
     StudyOut,
@@ -45,6 +47,7 @@ app = FastAPI(
         "上传影像 ZIP，使用用户提供的稳定密钥生成患者级伪名，重写 "
         "Patient/Study/Series/SOP/FrameOfReference UID 与身份字段，"
         "递归更新序列内引用并保持检查关系。提供标签变更预览与匿名化 ZIP 下载，"
+        "支持按匿名检查下载子集、跨多个同密钥任务合并下载同一检查，"
         "并支持对多个已完成任务做跨批次密钥指纹/伪名/UID 映射一致性核对。"
     ),
     lifespan=lifespan,
@@ -334,6 +337,103 @@ def consistency_check(body: ConsistencyCheckRequest) -> ConsistencyCheckOut:
     return ConsistencyCheckOut.model_validate(out)
 
 
+def _resolve_merge_jobs(job_ids: list[str], study_uid: str) -> list:
+    """合并类接口的统一前置校验：存在 -> 已完成 -> 同密钥指纹。"""
+    jobs = []
+    missing = []
+    for job_id in job_ids:
+        job = registry.get(job_id)
+        if job is None:
+            missing.append(job_id)
+        else:
+            jobs.append(job)
+    if missing:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "JOB_NOT_FOUND",
+                "message": "部分任务不存在或已过期",
+                "study_instance_uid": study_uid,
+                "missing_job_ids": missing,
+            },
+        )
+
+    not_ready = [
+        {"id": job.id, "status": job.status, "error": job.error or ""}
+        for job in jobs
+        if job.status != "ready"
+    ]
+    if not_ready:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "JOBS_NOT_COMPLETED",
+                "message": "仅支持已完成（status=ready）的任务",
+                "study_instance_uid": study_uid,
+                "not_ready_jobs": not_ready,
+            },
+        )
+
+    fingerprints = {job.id: job.secret_fingerprint for job in jobs}
+    if len(set(fingerprints.values())) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "SECRET_FINGERPRINT_MISMATCH",
+                "message": "任务使用了不同的稳定密钥（指纹不一致），拒绝跨密钥合并",
+                "study_instance_uid": study_uid,
+                "fingerprints": fingerprints,
+            },
+        )
+    return jobs
+
+
+@app.post(
+    "/jobs/merged-study/download",
+    tags=["jobs"],
+    summary="跨 2～5 个同密钥任务合并下载某个匿名检查（递归补全跨任务 SOP 引用，按匿名 UID 去重）",
+    responses={
+        404: {"model": MergedStudyErrorDetail,
+              "description": "部分任务不存在或已过期，或该匿名检查不在任一指定任务的成功输出中"},
+        409: {"model": MergedStudyErrorDetail,
+              "description": "部分任务未完成、密钥指纹不一致、同一匿名 SOP UID 输出字节冲突，"
+                             "或引用目标在所有指定任务中均不存在"},
+    },
+)
+def download_merged_study(body: MergedStudyDownloadRequest, background_tasks: BackgroundTasks):
+    jobs = _resolve_merge_jobs(body.job_ids, body.study_instance_uid)
+
+    try:
+        zip_path, stats = merged_study.write_merged_study_zip(
+            jobs, body.study_instance_uid, settings.work_dir
+        )
+    except merged_study.MergedStudyError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.detail) from exc
+
+    background_tasks.add_task(_safe_unlink, zip_path)
+    # Content-Disposition filename 只允许 token 字符；匿名 UID 为 2.25.<digits>，
+    # 点号安全，额外保留 UID 后 24 位避免过长
+    safe_uid = "".join(
+        ch for ch in body.study_instance_uid if ch.isalnum() or ch in ".-"
+    )
+    name = f"merged-study-{safe_uid[-24:]}.zip"
+    headers = {
+        "X-Merged-Job-Count": str(len(jobs)),
+        "X-Merged-Study-Initial-File-Count": str(stats.initial_uids),
+        "X-Merged-Study-Added-File-Count": str(stats.added_uids),
+        "X-Merged-Study-Deduped-Copy-Count": str(stats.deduped_copies),
+        "X-Merged-Study-File-Count": str(
+            stats.initial_uids + stats.added_uids
+        ),
+    }
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=name,
+        headers=headers,
+    )
+
+
 @app.get(
     "/jobs/{job_id}",
     response_model=JobOut,
@@ -466,6 +566,7 @@ def root() -> dict:
         "endpoints": [
             "POST /jobs",
             "POST /jobs/consistency-check",
+            "POST /jobs/merged-study/download",
             "GET /jobs/{job_id}",
             "GET /jobs/{job_id}/files",
             "GET /jobs/{job_id}/download",

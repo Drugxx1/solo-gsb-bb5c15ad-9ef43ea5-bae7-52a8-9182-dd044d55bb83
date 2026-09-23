@@ -70,6 +70,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | --- | --- | --- |
 | `POST` | `/jobs` | 上传 ZIP（multipart），同步处理并返回完整标签变更预览与诊断 |
 | `POST` | `/jobs/consistency-check` | 核对 2～5 个已完成任务的密钥指纹、患者伪名与 Study/Series/SOP UID 映射；支持差异明细分页（`level`/`limit`/`cursor`） |
+| `POST` | `/jobs/merged-study/download` | 跨 2～5 个**同密钥**任务合并下载某个匿名检查：递归补全跨任务 SOP 引用，按匿名 SOPInstanceUID 字节去重，冲突/缺失返回 `409` |
 | `GET` | `/jobs/{job_id}` | 获取任务结果（预览 + 诊断 + UID 映射概览） |
 | `GET` | `/jobs/{job_id}/files` | 仅获取逐文件诊断与变更列表 |
 | `GET` | `/jobs/{job_id}/download` | 下载匿名化后的 ZIP（全量） |
@@ -193,6 +194,141 @@ else:
 > 注意：匿名化时的悬空引用（`DANGLING_REFERENCE` 警告）会使引用闭包无法在本任务
 > 输出内闭合，因此含此类引用的检查子集下载会返回 `409`；请改全量下载
 > `GET /jobs/{id}/download`（行为不变），或在上传前补齐被引用实例。
+
+### 跨任务合并下载同一匿名检查（`POST /jobs/merged-study/download`）
+
+当同一个检查的实例被拆到**多个批次 ZIP** 上传时（只要使用**同一把稳定密钥**，
+匿名 UID 就可跨批次对齐），可用本接口一次性取回该检查的完整实例集合。数据**只来自
+各已完成任务 output 目录中的匿名 DICOM 文件**，不会重新解压或处理原始 ZIP。
+
+请求体（JSON）：
+
+```json
+{"job_ids": ["0d03…", "7f2a…", "a91f…"], "study_instance_uid": "2.25.8912…"}
+```
+
+- `job_ids`：**2～5 个**已完成（`status=ready`）任务 ID，不可重复、不可为空白，
+  否则 `422`；
+- `study_instance_uid`：**匿名后**的检查 UID，取自任一参与任务结果中的
+  `studies[].new_study_instance_uid`（或某文件的 `study_instance_uid`）。
+
+合并规则：
+
+1. 从各任务成功输出中选出属于该匿名检查的全部实例作为初选集合；
+2. 在**所有指定任务**的成功输出上建立全局匿名 SOPInstanceUID 索引，递归读取集合内
+   匿名 DICOM **任意序列层级**的 `ReferencedSOPInstanceUID`，把**跨任务**被引用的
+   实例（可属于其他匿名检查）补入集合，重复扫描直至闭包稳定；
+3. **按匿名 SOPInstanceUID 去重**：同一 UID 的多份输出（跨任务重复上传，或单任务内
+   重复 SOP 改名输出）**逐字节一致（SHA-256 相同）时只保留一份**；字节**不一致**则
+   返回 `409`，在 `detail.conflicting_sop_instance_uids` 与
+   `detail.problems[]`（`reason=byte_conflict`，附各份输出的任务 ID / 扁平文件名 /
+   SHA-256）中列出全部冲突 UID；
+4. 引用目标在**所有指定任务**的成功输出中均不存在时返回 `409`，在
+   `detail.missing_sop_instance_uids` 与 `detail.problems[]`
+   （`reason=missing_in_all_jobs`）中列出全部缺失的匿名 SOP UID；
+5. 字节冲突与缺失引用会在**同一次 409 响应中一次性全部列出**，任何情况下都
+   **不产生残缺 ZIP**；
+6. 只接受**相同密钥指纹**的任务：指纹不一致直接 `409`
+   （`SECRET_FINGERPRINT_MISMATCH`）；任一任务不存在/已过期返回 `404`，
+   未完成返回 `409`；该匿名检查在所有指定任务的成功输出中都不存在时返回 `404`
+   （`STUDY_NOT_FOUND`）。
+
+成功时返回**扁平 ZIP**：条目名即匿名 `SOPInstanceUID.dcm`（单任务内重复 SOP 的
+`<uid>-2.dcm` 改名输出也统一归并为 `<uid>.dcm`），**不含任何来源任务的目录结构、
+原始路径或任务 ID**；响应头给出计数：
+
+| 响应头 | 含义 |
+| --- | --- |
+| `X-Merged-Job-Count` | 参与合并的任务数（2～5） |
+| `X-Merged-Study-Initial-File-Count` | 初选集合的匿名 SOP UID 数（跨任务去重后） |
+| `X-Merged-Study-Added-File-Count` | 递归补入的跨任务/跨检查 SOP UID 数 |
+| `X-Merged-Study-Deduped-Copy-Count` | 字节一致而被丢弃的重复物理副本数 |
+| `X-Merged-Study-File-Count` | ZIP 总条目数（初选 + 补入，按 UID 去重） |
+
+```bash
+curl -X POST http://localhost:8000/jobs/merged-study/download \
+  -H "Content-Type: application/json" \
+  -d '{"job_ids": ["0d03abcd1234", "7f2a9876ef01"],
+       "study_instance_uid": "2.25.8912123456789012345678901234567"}' \
+  -OJ -D merged.headers
+grep -i '^x-merged-' merged.headers
+# x-merged-job-count: 2
+# x-merged-study-initial-file-count: 3
+# x-merged-study-added-file-count: 1
+# x-merged-study-deduped-copy-count: 1
+# x-merged-study-file-count: 4
+```
+
+Python 示例（含 404/409 处理）：
+
+```python
+resp = requests.post(
+    "http://localhost:8000/jobs/merged-study/download",
+    json={"job_ids": [job1_id, job2_id], "study_instance_uid": study_uid},
+)
+if resp.status_code == 404:
+    print("任务或匿名检查不存在：", resp.json()["detail"]["code"])
+elif resp.status_code == 409:
+    detail = resp.json()["detail"]
+    print("拒绝合并：", detail["code"])
+    for p in detail["problems"]:
+        # reason: byte_conflict（同 UID 多份输出字节不一致，p["copies"] 给出
+        #       各份的 job_id / output_file / sha256）
+        #       | missing_in_all_jobs（引用目标在所有指定任务中均不存在）
+        print(p["sop_instance_uid"], p["reason"])
+else:
+    resp.raise_for_status()
+    print("初选：", resp.headers["X-Merged-Study-Initial-File-Count"],
+          "补入：", resp.headers["X-Merged-Study-Added-File-Count"],
+          "去重副本：", resp.headers["X-Merged-Study-Deduped-Copy-Count"])
+    open("merged-study.zip", "wb").write(resp.content)
+```
+
+错误响应（HTTP 4xx，`detail.code` 机器可读）：
+
+| 状态码 | `detail.code` | 触发条件 |
+| --- | --- | --- |
+| `404` | `JOB_NOT_FOUND` | 任一任务 ID 不存在或已过期（`missing_job_ids`） |
+| `404` | `STUDY_NOT_FOUND` | 该匿名 StudyInstanceUID 不在任一指定任务的成功输出中 |
+| `409` | `JOBS_NOT_COMPLETED` | 存在 `status != ready` 的任务（`not_ready_jobs`） |
+| `409` | `SECRET_FINGERPRINT_MISMATCH` | 任务间密钥指纹不一致（`fingerprints`） |
+| `409` | `MERGED_REFERENCE_CLOSURE_INCOMPLETE` | 闭包无法在指定任务成功输出内闭合：`conflicting_sop_instance_uids`（字节冲突）与 `missing_sop_instance_uids`（引用缺失）同时给出，`problems[]` 逐项给出匿名 SOP UID、`reason`、来源任务与 SHA-256 |
+| `422` | —（Pydantic 校验） | 任务数不在 2～5、重复/空白 ID，或 `study_instance_uid` 为空白 |
+
+`409` 响应示例：
+
+```jsonc
+{
+  "detail": {
+    "code": "MERGED_REFERENCE_CLOSURE_INCOMPLETE",
+    "message": "跨任务引用闭包无法在指定任务的成功输出内闭合（存在缺失引用或字节冲突），已拒绝输出合并 ZIP",
+    "study_instance_uid": "2.25.8912…",
+    "conflicting_sop_instance_uids": ["2.25.1613…"],
+    "missing_sop_instance_uids": ["2.25.4242…"],
+    "problems": [
+      {"sop_instance_uid": "2.25.1613…",
+       "reason": "byte_conflict",
+       "job_ids": ["0d03…", "7f2a…"],
+       "copies": [
+         {"job_id": "0d03…", "output_file": "2.25.1613….dcm",
+          "sha256": "a3f1…"},
+         {"job_id": "7f2a…", "output_file": "2.25.1613….dcm",
+          "sha256": "9c0b…"}
+       ],
+       "message": "同一匿名 SOPInstanceUID 在不同任务（或重复输出）中的文件字节不一致，无法确定唯一内容"},
+      {"sop_instance_uid": "2.25.4242…",
+       "reason": "missing_in_all_jobs",
+       "job_ids": [],
+       "copies": [],
+       "message": "引用目标在所有指定任务的成功输出中均不存在"}
+    ]
+  }
+}
+```
+
+> 注意：建议先用 `POST /jobs/consistency-check` 核对批次。同一密钥下匿名输出理论上
+> 逐字节一致；`byte_conflict` 意味着参与批次的匿名化算法版本不一致或输出被篡改，
+> 此时应停止合并并排查来源批次。合并 ZIP 为一次性临时文件，响应结束后即从磁盘删除。
 
 错误响应（HTTP 4xx，`detail.code` 机器可读）：
 
@@ -597,17 +733,18 @@ else:
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由（/jobs、/jobs/consistency-check、全量/检查子集下载、/health）
+│   ├── main.py          # FastAPI 路由（/jobs、/jobs/consistency-check、/jobs/merged-study/download、全量/检查子集下载、/health）
 │   ├── anonymizer.py    # 两遍扫描引擎：UID 映射、标签重写、递归序列、诊断、ZIP 打包
 │   ├── study_subset.py  # 按匿名 StudyInstanceUID 的引用闭包解析与子集 ZIP（复用匿名输出）
+│   ├── merged_study.py  # 跨 2～5 个同密钥任务的检查合并：跨任务引用闭包、字节去重/冲突/缺失 409
 │   ├── consistency.py   # 跨任务一致性核对：密钥指纹/患者伪名/UID 映射比对与差异明细分页
 │   ├── pagination.py    # 差异明细不透明分页游标：HMAC 签名、绑定任务集合/level、TTL
 │   ├── crypto.py        # HMAC 确定性派生：伪名、UID、日期偏移
 │   ├── tags.py          # Annex E 标签策略与参与一致性重写的 UID 标签集合
 │   ├── jobs.py          # 任务存储、线程池处理、TTL 清理
-│   ├── schemas.py       # 请求/响应模型（含一致性核对、分页与子集下载错误模型）
+│   ├── schemas.py       # 请求/响应模型（含一致性核对、分页、子集/合并下载错误模型）
 │   └── config.py        # 环境变量配置
-├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / 分页游标 / 检查子集（110 个用例）
+├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / 分页游标 / 检查子集 / 跨任务合并（127 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
