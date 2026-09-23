@@ -1,0 +1,32 @@
+services:
+  dicom-anon-api:
+    build: .
+    image: dicom-anon-api:latest
+    container_name: dicom-anon-api
+    ports:
+      - "${DICOM_ANON_PORT:-8000}:8000"
+    environment:
+      # 任务临时目录（挂载卷，便于检查/清理）
+      DICOM_ANON_WORK_DIR: /data/dicom-anon
+      # 上传 ZIP 大小上限（默认 512 MiB）
+      DICOM_ANON_MAX_UPLOAD_BYTES: "536870912"
+      # 解压后总大小上限（默认 2 GiB）
+      DICOM_ANON_MAX_EXTRACTED_BYTES: "2147483648"
+      # 解压文件数上限
+      DICOM_ANON_MAX_EXTRACTED_FILES: "20000"
+      # 任务结果保留时长（秒）
+      DICOM_ANON_JOB_TTL_SECONDS: "3600"
+      # 稳定密钥最小长度
+      DICOM_ANON_MIN_SECRET_LENGTH: "8"
+    volumes:
+      - dicom-anon-data:/data/dicom-anon
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  dicom-anon-data:
