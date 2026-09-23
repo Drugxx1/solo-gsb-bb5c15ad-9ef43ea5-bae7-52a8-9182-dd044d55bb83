@@ -12,7 +12,7 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadF
 from fastapi.responses import FileResponse
 
 from .anonymizer import JobResult
-from . import consistency, pagination, study_subset
+from . import consistency, merged_study, pagination, study_subset
 from .config import settings
 from .jobs import registry
 from .schemas import (
@@ -23,6 +23,8 @@ from .schemas import (
     CursorErrorDetail,
     FileOut,
     JobOut,
+    MergedStudyDownloadRequest,
+    MergedStudyErrorDetail,
     PatientOut,
     SeriesOut,
     StudyOut,
@@ -334,6 +336,106 @@ def consistency_check(body: ConsistencyCheckRequest) -> ConsistencyCheckOut:
     return ConsistencyCheckOut.model_validate(out)
 
 
+def _load_ready_jobs_same_secret(job_ids: list[str], study_uid: str | None = None):
+    """加载任务并校验：全部存在、status=ready、密钥指纹一致；否则抛 404/409。
+
+    供跨任务合并下载使用，错误体遵循 MergedStudyErrorDetail。
+    """
+    jobs = []
+    missing = []
+    for job_id in job_ids:
+        job = registry.get(job_id)
+        if job is None:
+            missing.append(job_id)
+        else:
+            jobs.append(job)
+    if missing:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "JOB_NOT_FOUND",
+                "message": "部分任务不存在或已过期",
+                "missing_job_ids": missing,
+                **({"study_instance_uid": study_uid} if study_uid else {}),
+            },
+        )
+
+    not_ready = [
+        {"id": job.id, "status": job.status, "error": job.error or ""}
+        for job in jobs
+        if job.status != "ready"
+    ]
+    if not_ready:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "JOBS_NOT_COMPLETED",
+                "message": "仅支持已完成（status=ready）的任务",
+                "not_ready_jobs": not_ready,
+                **({"study_instance_uid": study_uid} if study_uid else {}),
+            },
+        )
+
+    fingerprints = {job.id: job.secret_fingerprint for job in jobs}
+    if len(set(fingerprints.values())) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "SECRET_FINGERPRINT_MISMATCH",
+                "message": "任务使用了不同的稳定密钥（指纹不一致），无法合并下载",
+                "fingerprints": fingerprints,
+                **({"study_instance_uid": study_uid} if study_uid else {}),
+            },
+        )
+    return jobs
+
+
+@app.post(
+    "/jobs/merged-study/download",
+    tags=["jobs"],
+    summary="跨 2～5 个同密钥任务合并下载某匿名检查（递归补全跨任务 SOP 引用、按匿名 SOP UID 去重）",
+    responses={
+        404: {"model": MergedStudyErrorDetail,
+              "description": "部分任务不存在，或该匿名检查不在任何指定任务的成功输出中"},
+        409: {"model": MergedStudyErrorDetail,
+              "description": "部分任务未完成、密钥指纹不一致、同一匿名 SOP UID 的文件字节冲突，"
+                             "或引用目标在所有指定任务中均不存在"},
+    },
+)
+def download_merged_study(
+    body: MergedStudyDownloadRequest,
+    background_tasks: BackgroundTasks,
+):
+    jobs = _load_ready_jobs_same_secret(body.job_ids, body.study_instance_uid)
+
+    try:
+        zip_path, closure = merged_study.write_merged_study_zip(
+            jobs, body.study_instance_uid, settings.work_dir
+        )
+    except merged_study.MergedStudyError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.detail) from exc
+
+    background_tasks.add_task(_safe_unlink, zip_path)
+    # Content-Disposition filename 只允许 token 字符；匿名 UID 为 2.25.<digits>，
+    # 点号安全，额外保留 UID 后 24 位避免过长
+    safe_uid = "".join(
+        ch for ch in body.study_instance_uid if ch.isalnum() or ch in ".-"
+    )
+    name = f"merged-study-{safe_uid[-24:]}.zip"
+    headers = {
+        "X-Merged-Initial-File-Count": str(closure.initial_copies),
+        "X-Merged-Added-Uid-Count": str(closure.added_uid_count),
+        "X-Merged-Deduped-File-Count": str(closure.deduped_count),
+        "X-Merged-Zip-File-Count": str(closure.file_count),
+    }
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=name,
+        headers=headers,
+    )
+
+
 @app.get(
     "/jobs/{job_id}",
     response_model=JobOut,
@@ -466,6 +568,7 @@ def root() -> dict:
         "endpoints": [
             "POST /jobs",
             "POST /jobs/consistency-check",
+            "POST /jobs/merged-study/download",
             "GET /jobs/{job_id}",
             "GET /jobs/{job_id}/files",
             "GET /jobs/{job_id}/download",
